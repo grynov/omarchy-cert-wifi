@@ -114,6 +114,18 @@ EDUROAM_OUT=$(printf "\n" | "$HELPER" inspect --file "$EDUROAM_P12")
 echo "$EDUROAM_OUT" | jq -e '.success == true and .suggestedSsid == "eduroam" and .domain == "eduroam.example.edu"' >/dev/null
 echo "PASS: Auto-suggested SSID and domain for eduroam/easyroam certificate"
 
+echo "=== Test 11b: Easyroam PCA Realm to easyroam.eduroam.de Domain Normalization ==="
+EASYROAM_KEY="$TEST_TMP_DIR/easyroam.key"
+EASYROAM_CRT="$TEST_TMP_DIR/easyroam.crt"
+EASYROAM_P12="$TEST_TMP_DIR/easyroam.p12"
+openssl req -newkey rsa:2048 -keyout "$EASYROAM_KEY" -out "$TEST_TMP_DIR/easyroam.csr" -nodes -subj "/CN=user_sample@easyroam-pca.example.edu/OU=easyroam" 2>/dev/null
+openssl x509 -req -in "$TEST_TMP_DIR/easyroam.csr" -CA "$MOCK_CA_CRT" -CAkey "$MOCK_CA_KEY" -CAcreateserial -out "$EASYROAM_CRT" -days 180 2>/dev/null
+openssl pkcs12 -export -out "$EASYROAM_P12" -inkey "$EASYROAM_KEY" -in "$EASYROAM_CRT" -certfile "$MOCK_CA_CRT" -passout "pass:" 2>/dev/null
+
+EASYROAM_OUT=$(printf "\n" | "$HELPER" inspect --file "$EASYROAM_P12")
+echo "$EASYROAM_OUT" | jq -e '.success == true and .suggestedSsid == "eduroam" and .domain == "easyroam.eduroam.de"' >/dev/null
+echo "PASS: Easyroam PCA realm correctly mapped to easyroam.eduroam.de domain"
+
 echo "=== Test 12: Unicode / Symbol SSID Slug & Profiles Directory Protection (SEC-01) ==="
 UNICODE_OUT=$(printf "%s" "$TEST_PASS" | "$HELPER" install --file "$MOCK_P12" --ssid "日本語" --domain "enterprise.com")
 UNICODE_PID=$(echo "$UNICODE_OUT" | jq -r '.profileId')

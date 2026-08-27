@@ -111,6 +111,10 @@ function extractDomainFromIdentity(identity) {
   var domain = id.substring(atIdx + 1).trim();
   // Strip trailing quotes, slashes, semicolons, or dots
   domain = domain.replace(/[\/'"\\;\s]+$/g, "").replace(/^\.+|\.+$/g, "");
+  // Easyroam PCA realms (e.g. easyroam-pca.uni-xxx.de) are client identities, not RADIUS server domains
+  if (/^easyroam-pca\./i.test(domain) || /^easyroam\./i.test(domain) || /easyroam/i.test(domain)) {
+    return "easyroam.eduroam.de";
+  }
   return domain;
 }
 

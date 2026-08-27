@@ -262,9 +262,6 @@ Panel {
           if (res.identity && res.identity !== "" && root.identityText === "") {
             root.identityText = res.identity
           }
-          if (root.anonIdentityText === "" && root.domainText !== "") {
-            root.anonIdentityText = "anonymous@" + root.domainText
-          }
           if (!res.hasCa && (root.domainText === "")) {
             root.showAdvanced = true
           }
@@ -299,7 +296,7 @@ Panel {
       onRead: function(line) {
         var res = Model.parseJson(line, null)
         if (res && res.success) {
-          root.statusMessage = "Connected to " + res.ssid + "! Certificate valid for " + res.daysRemaining + " days."
+          root.statusMessage = "Profile installed for " + res.ssid + " (" + res.daysRemaining + " days valid). Activating connection…"
           root.errorMessage = ""
           root.clearInputFields()
           root.currentTab = "profiles"

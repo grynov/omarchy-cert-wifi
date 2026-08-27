@@ -218,8 +218,15 @@ cmd_inspect() {
 
   # Auto-extract realm domain suffix for MitM server certificate validation
   domain=""
-  if [[ "$identity" =~ @([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}) ]]; then
-    domain="${BASH_REMATCH[1]}"
+  if [[ "$issuer" =~ (easyroam|geteduroam) || "$subject" =~ easyroam || "$identity" =~ easyroam ]]; then
+    domain="easyroam.eduroam.de"
+  elif [[ "$identity" =~ @([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}) ]]; then
+    local extracted_realm="${BASH_REMATCH[1]}"
+    if [[ "$extracted_realm" =~ ^easyroam-pca\. || "$extracted_realm" =~ easyroam ]]; then
+      domain="easyroam.eduroam.de"
+    else
+      domain="$extracted_realm"
+    fi
   fi
   if [[ -z "$domain" ]]; then
     local san_domain
@@ -444,6 +451,16 @@ cmd_install() {
     # Clean up any existing connection with this SSID to avoid duplicates
     nmcli connection delete id "$ssid" >/dev/null 2>&1 || nmcli connection delete "$ssid" >/dev/null 2>&1 || true
 
+    # Detect easyroam: client cert issued by DFN-Verein/geteduroam, served via easyroam infrastructure.
+    # For easyroam EAP-TLS: no anonymous-identity (RADIUS routes on cert CN), and the RADIUS server
+    # cert chain (Sectigo) differs from the bundled Comodo CA, so use system trust store instead.
+    local is_easyroam=false
+    local client_issuer
+    client_issuer=$(openssl x509 -noout -issuer -in "$profile_dir/client.crt" 2>/dev/null || echo "")
+    if [[ "$client_issuer" =~ (easyroam|geteduroam|DFN-Verein) || "$domain" =~ easyroam ]]; then
+      is_easyroam=true
+    fi
+
     local nm_args=(
       connection add
       type wifi
@@ -459,17 +476,26 @@ cmd_install() {
       802-1x.ca-cert-password-flags 4
     )
 
-    if [[ -n "$anonymous_identity" ]]; then
+    # For EAP-TLS the client cert already carries the identity; anonymous-identity is only
+    # appropriate for PEAP/TTLS outer tunnels. Skip it for easyroam to avoid RADIUS routing failures.
+    if [[ -n "$anonymous_identity" && "$is_easyroam" == "false" ]]; then
       nm_args+=(802-1x.anonymous-identity "$anonymous_identity")
     fi
 
-    if [[ "$has_ca" == "true" ]]; then
+    if [[ "$is_easyroam" == "true" ]]; then
+      # easyroam RADIUS server cert is signed by Sectigo, not the Comodo root in the bundle.
+      # Use the system trust store so wpa_supplicant can verify the full server cert chain.
+      nm_args+=(802-1x.system-ca-certs yes)
+    elif [[ "$has_ca" == "true" ]]; then
       nm_args+=(802-1x.ca-cert "$profile_dir/ca.crt")
     else
       nm_args+=(802-1x.system-ca-certs yes)
     fi
 
     if [[ -n "$domain" ]]; then
+      if [[ "$domain" =~ ^easyroam-pca\. || "$domain" =~ easyroam ]]; then
+        domain="easyroam.eduroam.de"
+      fi
       # Strip leading wildcard for NetworkManager domain-suffix-match
       local nm_domain="$domain"
       nm_domain="${nm_domain#\*.}"
@@ -477,7 +503,7 @@ cmd_install() {
     fi
 
     nmcli "${nm_args[@]}" >/dev/null || die "NetworkManager failed to add 802.1X profile."
-    
+
     # Trigger connection attempt with short timeout (best effort)
     nmcli --wait 4 connection up id "$ssid" >/dev/null 2>&1 || nmcli --wait 4 connection up "$ssid" >/dev/null 2>&1 || true
 
@@ -492,6 +518,9 @@ cmd_install() {
     clean_anon="${clean_anon//$'\n'/}"
     local clean_domain="${domain//$'\r'/}"
     clean_domain="${clean_domain//$'\n'/}"
+    if [[ "$clean_domain" =~ ^easyroam-pca\. || "$clean_domain" =~ easyroam ]]; then
+      clean_domain="easyroam.eduroam.de"
+    fi
 
     local iwd_conf="[Security]
 EAP-Method=TLS
@@ -656,6 +685,7 @@ cmd_delete() {
 
 cmd_connect() {
   local ssid=""
+  local profile_id_arg=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ssid) ssid="$2"; shift 2 ;;
@@ -664,6 +694,7 @@ cmd_connect() {
         query_id=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
         if [[ "$query_id" =~ ^[a-z0-9_-]+$ && "$query_id" != "." && "$query_id" != ".." && -f "$PROFILES_DIR/$query_id/profile.json" ]]; then
           ssid=$(jq -r '.ssid // ""' "$PROFILES_DIR/$query_id/profile.json" 2>/dev/null || echo "")
+          profile_id_arg="$query_id"
         fi
         shift 2 ;;
       *) shift ;;
@@ -673,6 +704,22 @@ cmd_connect() {
   [[ -n "$ssid" ]] || die "SSID required to connect."
 
   if command -v nmcli >/dev/null 2>&1; then
+    # Sanitize the existing NM connection before activating:
+    # Remove any stale anonymous-identity for easyroam profiles (causes RADIUS routing failure)
+    local profile_json=""
+    if [[ -n "$profile_id_arg" && -f "$PROFILES_DIR/$profile_id_arg/profile.json" ]]; then
+      profile_json=$(cat "$PROFILES_DIR/$profile_id_arg/profile.json" 2>/dev/null || echo "")
+    fi
+    local stored_issuer=""
+    if [[ -f "$PROFILES_DIR/$profile_id_arg/client.crt" ]]; then
+      stored_issuer=$(openssl x509 -noout -issuer -in "$PROFILES_DIR/$profile_id_arg/client.crt" 2>/dev/null || echo "")
+    fi
+    local stored_domain
+    stored_domain=$(printf '%s' "$profile_json" | jq -r '.domain // ""' 2>/dev/null || echo "")
+    if [[ "$stored_issuer" =~ (easyroam|geteduroam|DFN-Verein) || "$stored_domain" =~ easyroam ]]; then
+      nmcli connection modify id "$ssid" 802-1x.anonymous-identity "" 802-1x.system-ca-certs yes >/dev/null 2>&1 || \
+        nmcli connection modify "$ssid" 802-1x.anonymous-identity "" 802-1x.system-ca-certs yes >/dev/null 2>&1 || true
+    fi
     nmcli connection up id "$ssid" >/dev/null 2>&1 || nmcli connection up "$ssid" >/dev/null || die "Failed to activate $ssid via nmcli."
   elif command -v iwctl >/dev/null 2>&1; then
     local wlan_dev

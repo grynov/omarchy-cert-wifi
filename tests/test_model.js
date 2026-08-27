@@ -80,6 +80,8 @@ assert.strictEqual(Model.extractDomainFromIdentity("user@example.edu"), "example
 assert.strictEqual(Model.extractDomainFromIdentity("user@example.edu/"), "example.edu");
 assert.strictEqual(Model.extractDomainFromIdentity("user@example.edu."), "example.edu");
 assert.strictEqual(Model.extractDomainFromIdentity("user@example.edu;"), "example.edu");
+assert.strictEqual(Model.extractDomainFromIdentity("sample_user@easyroam-pca.example.edu"), "easyroam.eduroam.de");
+assert.strictEqual(Model.extractDomainFromIdentity("user@easyroam.de"), "easyroam.eduroam.de");
 assert.strictEqual(Model.extractDomainFromIdentity("no-domain"), "");
 console.log("PASS: extractDomainFromIdentity");
 

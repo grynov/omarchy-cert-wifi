@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.grynov.cert-wifi",
   "name": "Certificate Wi-Fi",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "grynov",
   "license": "MIT",
   "description": "Universal 802.1X EAP-TLS certificate Wi-Fi manager with automatic PKCS#12 extraction, validity monitoring, and instant setup.",
