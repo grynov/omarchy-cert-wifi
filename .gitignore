@@ -1,0 +1,11 @@
+# Security: never commit private keys or certificate bundles
+*.p12
+*.pfx
+*.crt
+*.key
+*.pem
+
+# Local build / cache
+.DS_Store
+*.swp
+*~
