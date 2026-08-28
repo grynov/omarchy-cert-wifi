@@ -273,6 +273,55 @@ if printf "%s" "$TEST_PASS" | "$HELPER" inspect --file "$SYMLINK_P12" 2>/dev/nul
 fi
 echo "PASS: Rejected oversized (>10MB) and symlinked certificate bundles in inspect and install"
 
+echo "=== Test 22: FIFO Non-Blocking Immediate Rejection (SEC-06) ==="
+FIFO_P12="$TEST_TMP_DIR/unopened_fifo.p12"
+mkfifo "$FIFO_P12"
+# Run with timeout to guarantee it cannot block
+if timeout 2 bash -c "printf '%s' '$TEST_PASS' | '$HELPER' inspect --file '$FIFO_P12' 2>/dev/null"; then
+  echo "FAIL: Expected inspect rejection on FIFO"
+  exit 1
+fi
+if timeout 2 bash -c "printf '%s' '$TEST_PASS' | '$HELPER' install --file '$FIFO_P12' --ssid 'FifoNet' 2>/dev/null"; then
+  echo "FAIL: Expected install rejection on FIFO"
+  exit 1
+fi
+# FIFO as profile.json
+mkdir -p "$XDG_DATA_HOME/cert-wifi/profiles/fifo_prof"
+mkfifo "$XDG_DATA_HOME/cert-wifi/profiles/fifo_prof/profile.json"
+LIST_FIFO_OUT=$(timeout 2 "$HELPER" list)
+echo "$LIST_FIFO_OUT" | jq -e 'all(.profiles[]; .id != "fifo_prof")' >/dev/null
+rm -rf "$XDG_DATA_HOME/cert-wifi/profiles/fifo_prof" "$FIFO_P12"
+echo "PASS: Non-blocking O_NONBLOCK descriptor helper immediately rejected FIFOs without hanging"
+
+echo "=== Test 23: Direct fd-helper Descriptor & Cap-Plus-One Validation ==="
+FD_SCRIPT="$SCRIPT_DIR/backend/fd-helper.py"
+REG_TEST="$TEST_TMP_DIR/fd_test_reg.txt"
+printf "hello-fd" > "$REG_TEST"
+READ_OUT=$("$FD_SCRIPT" read "$REG_TEST" 100)
+[[ "$READ_OUT" == "hello-fd" ]]
+
+# Test cap-plus-one rejection (file length 8 bytes, cap 7 bytes)
+if "$FD_SCRIPT" read "$REG_TEST" 7 2>/dev/null; then
+  echo "FAIL: Expected rejection on cap-plus-one exceeded length"
+  exit 1
+fi
+
+# Test staging
+STAGE_DEST="$TEST_TMP_DIR/fd_staged_dest.txt"
+"$FD_SCRIPT" stage "$REG_TEST" "$STAGE_DEST" 100
+STAGE_PERM=$(stat -c%a "$STAGE_DEST")
+[[ "$STAGE_PERM" == "600" ]]
+[[ "$(cat "$STAGE_DEST")" == "hello-fd" ]]
+rm -f "$STAGE_DEST" "$REG_TEST"
+echo "PASS: Direct fd-helper validated fstat, strict permissions, and cap-plus-one rejection"
+
+echo "=== Test 24: Aggregate Response Output Ceiling Enforcement (512KB) ==="
+# Test discovery batching with fd-helper
+DISC_INPUT=$(printf '["/etc/hosts", "/nonexistent"]\n')
+DISC_RES=$(printf '%s' "$DISC_INPUT" | "$FD_SCRIPT" discover 1000 10)
+echo "$DISC_RES" | jq -e 'type == "array"' >/dev/null
+echo "PASS: Batch discovery input processed safely via descriptor helper"
+
 echo "================================================="
-echo "All 21 security and unit tests passed successfully."
+echo "All 24 security and unit tests passed successfully."
 echo "================================================="

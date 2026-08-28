@@ -4,12 +4,19 @@
 set -euo pipefail
 umask 077
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FD_HELPER="$SCRIPT_DIR/fd-helper.py"
+
 if ! command -v jq >/dev/null 2>&1; then
   echo '{"success":false,"error":"Missing required dependency: jq"}' >&2
   exit 1
 fi
 if ! command -v openssl >/dev/null 2>&1; then
   echo '{"success":false,"error":"Missing required dependency: openssl"}' >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo '{"success":false,"error":"Missing required dependency: python3"}' >&2
   exit 1
 fi
 
@@ -31,8 +38,8 @@ chmod 700 "$BASE_DIR" "$PROFILES_DIR" 2>/dev/null || true
 TMP_DIR=""
 cleanup() {
   if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR:-}" ]]; then
-    # Overwrite and shred sensitive decrypted private keys before directory removal
-    find "$TMP_DIR" -type f -name "*.key" -exec shred -u {} + 2>/dev/null || true
+    # Overwrite and shred sensitive decrypted private keys and staged bundles before directory removal
+    find "$TMP_DIR" -type f \( -name "*.key" -o -name "*.p12" -o -name "*.pfx" \) -exec shred -u {} + 2>/dev/null || true
     rm -rf "$TMP_DIR"
   fi
 }
@@ -44,24 +51,12 @@ die() {
   exit 1
 }
 
-# Validate that a file is a regular file, not a symlink, and within max byte limit
-is_safe_regular_file() {
-  local f="$1"
-  local max_bytes="${2:-$MAX_CERT_FILE_SIZE}"
-  [[ -f "$f" && ! -L "$f" ]] || return 1
-  local size
-  size=$(stat -c%s "$f" 2>/dev/null || echo -1)
-  (( size >= 0 && size <= max_bytes )) || return 1
-  return 0
-}
-
-# Safely read and validate profile.json without unbounded reads or symlink traversal
+# Safely read and validate profile.json using descriptor helper (O_NOFOLLOW|O_NONBLOCK, fstat, bounded read)
 read_safe_profile_json() {
   local pdir="$1"
   local json_file="$pdir/profile.json"
-  if is_safe_regular_file "$json_file" "$MAX_PROFILE_JSON_SIZE"; then
-    local content
-    content=$(head -c "$MAX_PROFILE_JSON_SIZE" "$json_file" 2>/dev/null || echo "")
+  local content
+  if content=$("$FD_HELPER" read "$json_file" "$MAX_PROFILE_JSON_SIZE" 2>/dev/null); then
     if [[ -n "$content" ]] && jq -e . <<< "$content" >/dev/null 2>&1; then
       printf '%s' "$content"
       return 0
@@ -128,7 +123,7 @@ get_iwd_profile_path() {
   fi
 }
 
-# Dynamically detect if OpenSSL needs -legacy to decrypt PKCS12 bundles
+# Dynamically detect if OpenSSL needs -legacy to decrypt PKCS12 bundles (consumed from staged private file)
 detect_pkcs12_flag() {
   local file="$1"
   local pass="$2"
@@ -155,39 +150,21 @@ cmd_discover() {
   [[ -d "$HOME/Documents" ]]   && search_dirs+=("$HOME/Documents")
   [[ -d "$HOME" ]]             && search_dirs+=("$HOME")
 
-  local found=()
+  local raw_candidates=()
   for dir in "${search_dirs[@]}"; do
     local max_d=2
     [[ "$dir" == "$HOME" ]] && max_d=1
     while IFS= read -r f; do
       [[ -n "$f" ]] || continue
-      if is_safe_regular_file "$f" "$MAX_CERT_FILE_SIZE"; then
-        found+=("$f")
-        if (( ${#found[@]} >= MAX_DISCOVER_FILES )); then
-          break 2
-        fi
-      fi
+      raw_candidates+=("$f")
     done < <(find "$dir" -maxdepth "$max_d" -type f \( -name "*.p12" -o -name "*.pfx" \) 2>/dev/null | head -n "$MAX_DISCOVER_SCAN_PER_DIR")
   done
 
-  mapfile -t unique_found < <(printf '%s\n' "${found[@]}" | sort -u | head -n "$MAX_DISCOVER_FILES")
-
-  local file_items=()
-  for f in "${unique_found[@]}"; do
-    [[ -n "$f" ]] || continue
-    if is_safe_regular_file "$f" "$MAX_CERT_FILE_SIZE"; then
-      local fname size mtime
-      fname=$(basename "$f")
-      size=$(stat -c%s "$f" 2>/dev/null || echo 0)
-      mtime=$(stat -c%Y "$f" 2>/dev/null || echo 0)
-      file_items+=("$(jq -c -n --arg path "$f" --arg name "$fname" --argjson size "$size" --argjson mtime "$mtime" \
-        '{path: $path, name: $name, size: $size, mtime: $mtime}')")
-    fi
-  done
-
   local file_results="[]"
-  if (( ${#file_items[@]} > 0 )); then
-    file_results=$(printf '%s\n' "${file_items[@]}" | jq -c -s '.')
+  if (( ${#raw_candidates[@]} > 0 )); then
+    local candidates_json
+    candidates_json=$(printf '%s\n' "${raw_candidates[@]}" | sort -u | jq -R . | jq -s .)
+    file_results=$(printf '%s' "$candidates_json" | "$FD_HELPER" discover "$MAX_CERT_FILE_SIZE" "$MAX_DISCOVER_FILES" 2>/dev/null || echo "[]")
   fi
 
   # 2. Discover visible Wi-Fi networks
@@ -235,30 +212,34 @@ cmd_inspect() {
 
   [[ -n "$file" ]] || die "File not provided."
   file="${file/#\~/$HOME}"
-  is_safe_regular_file "$file" "$MAX_CERT_FILE_SIZE" || die "File not found, is not a regular file, or exceeds maximum allowable size (10 MB): $file"
 
   if [[ "$pass_given" != "true" ]] && ! [ -t 0 ]; then
     IFS= read -t 1 -r pass || true
   fi
 
-  local flag
-  flag=$(detect_pkcs12_flag "$file" "$pass")
-  [[ "$flag" != "INVALID" ]] || die "Cannot decrypt PKCS#12 file (invalid password or corrupted certificate bundle)."
-
   TMP_DIR=$(mktemp -d -p "$BASE_DIR" .tmp_XXXXXX)
   chmod 700 "$TMP_DIR"
+  local staged_bundle="$TMP_DIR/staged.p12"
+
+  # Descriptor-based safe copy: opens once with O_NOFOLLOW|O_NONBLOCK, validates owner/type/size, reads cap+1
+  "$FD_HELPER" stage "$file" "$staged_bundle" "$MAX_CERT_FILE_SIZE" || die "File not found, not a regular file owned by current user, or exceeds maximum allowable size (10 MB): $file"
+
+  local flag
+  flag=$(detect_pkcs12_flag "$staged_bundle" "$pass")
+  [[ "$flag" != "INVALID" ]] || die "Cannot decrypt PKCS#12 file (invalid password or corrupted certificate bundle)."
+
   local leaf_cert="$TMP_DIR/leaf.crt"
   local ca_cert="$TMP_DIR/ca.crt"
 
   if [[ -n "$flag" ]]; then
-    openssl pkcs12 -in "$file" -legacy -passin stdin -nodes -clcerts -nokeys <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -legacy -passin stdin -nodes -clcerts -nokeys <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$leaf_cert" || true
-    openssl pkcs12 -in "$file" -legacy -passin stdin -nodes -cacerts -nokeys <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -legacy -passin stdin -nodes -cacerts -nokeys <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$ca_cert" || true
   else
-    openssl pkcs12 -in "$file" -passin stdin -nodes -clcerts -nokeys <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -passin stdin -nodes -clcerts -nokeys <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$leaf_cert" || true
-    openssl pkcs12 -in "$file" -passin stdin -nodes -cacerts -nokeys <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -passin stdin -nodes -cacerts -nokeys <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$ca_cert" || true
   fi
 
@@ -381,7 +362,6 @@ cmd_install() {
 
   [[ -n "$file" ]] || die "Certificate file not provided."
   file="${file/#\~/$HOME}"
-  is_safe_regular_file "$file" "$MAX_CERT_FILE_SIZE" || die "Certificate file not found, is not a regular file, or exceeds maximum allowable size (10 MB): $file"
   [[ -n "$ssid" ]] || die "SSID cannot be empty."
 
   local ssid_bytes
@@ -392,8 +372,15 @@ cmd_install() {
     IFS= read -t 1 -r pass || true
   fi
 
+  TMP_DIR=$(mktemp -d -p "$BASE_DIR" .tmp_XXXXXX)
+  chmod 700 "$TMP_DIR"
+  local staged_bundle="$TMP_DIR/staged.p12"
+
+  # Descriptor-based safe copy: opens once with O_NOFOLLOW|O_NONBLOCK, validates owner/type/size, reads cap+1
+  "$FD_HELPER" stage "$file" "$staged_bundle" "$MAX_CERT_FILE_SIZE" || die "Certificate file not found, not a regular file owned by current user, or exceeds maximum allowable size (10 MB): $file"
+
   local flag
-  flag=$(detect_pkcs12_flag "$file" "$pass")
+  flag=$(detect_pkcs12_flag "$staged_bundle" "$pass")
   [[ "$flag" != "INVALID" ]] || die "Cannot decrypt PKCS#12 bundle. Check your password."
 
   # Generate clean profile slug based on SSID with deterministic fallback
@@ -405,26 +392,23 @@ cmd_install() {
   # Guard: ensure profile_dir is strictly a subdirectory of PROFILES_DIR
   [[ "$profile_dir" == "$PROFILES_DIR/$profile_id" && "$profile_id" != "" ]] || die "Invalid profile directory resolution."
 
-  TMP_DIR=$(mktemp -d -p "$BASE_DIR" .tmp_XXXXXX)
-  chmod 700 "$TMP_DIR"
-
   local client_cert="$TMP_DIR/client.crt"
   local ca_cert="$TMP_DIR/ca.crt"
   local client_key="$TMP_DIR/client.key"
 
   if [[ -n "$flag" ]]; then
-    openssl pkcs12 -in "$file" -legacy -passin stdin -nodes -clcerts -nokeys <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -legacy -passin stdin -nodes -clcerts -nokeys <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$client_cert" || true
-    openssl pkcs12 -in "$file" -legacy -passin stdin -nodes -cacerts -nokeys <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -legacy -passin stdin -nodes -cacerts -nokeys <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$ca_cert" || true
-    openssl pkcs12 -in "$file" -legacy -passin stdin -nodes -nocerts <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -legacy -passin stdin -nodes -nocerts <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$client_key" || true
   else
-    openssl pkcs12 -in "$file" -passin stdin -nodes -clcerts -nokeys <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -passin stdin -nodes -clcerts -nokeys <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$client_cert" || true
-    openssl pkcs12 -in "$file" -passin stdin -nodes -cacerts -nokeys <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -passin stdin -nodes -cacerts -nokeys <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$ca_cert" || true
-    openssl pkcs12 -in "$file" -passin stdin -nodes -nocerts <<< "$pass" 2>/dev/null \
+    openssl pkcs12 -in "$staged_bundle" -passin stdin -nodes -nocerts <<< "$pass" 2>/dev/null \
       | sed -n '/-----BEGIN/,/-----END/p' > "$client_key" || true
   fi
 
@@ -652,6 +636,7 @@ AutoConnect=true
     }')
   safe_emit_json "$out"
 }
+
 cmd_list() {
   local active_ssid=""
   if command -v nmcli >/dev/null 2>&1; then
@@ -686,8 +671,9 @@ cmd_list() {
 
     local client_cert="$pdir/client.crt"
     local not_after="" end_epoch=0 now_epoch=0 days_remaining=0
-    if is_safe_regular_file "$client_cert" "$MAX_CERT_CRT_SIZE"; then
-      not_after=$(openssl x509 -noout -enddate -in "$client_cert" 2>/dev/null | cut -d= -f2 || echo "")
+    local crt_bytes
+    if crt_bytes=$("$FD_HELPER" read "$client_cert" "$MAX_CERT_CRT_SIZE" 2>/dev/null); then
+      not_after=$(printf '%s' "$crt_bytes" | openssl x509 -noout -enddate -in /dev/stdin 2>/dev/null | cut -d= -f2 || echo "")
       if [[ -n "$not_after" ]]; then
         end_epoch=$(LC_ALL=C date -d "$not_after" +%s 2>/dev/null || echo 0)
         now_epoch=$(date +%s)
@@ -805,8 +791,9 @@ cmd_connect() {
       profile_json=$(read_safe_profile_json "$PROFILES_DIR/$profile_id_arg" || echo "")
     fi
     local stored_issuer=""
-    if [[ -n "$profile_id_arg" && -n "$profile_json" ]] && is_safe_regular_file "$PROFILES_DIR/$profile_id_arg/client.crt" "$MAX_CERT_CRT_SIZE"; then
-      stored_issuer=$(openssl x509 -noout -issuer -in "$PROFILES_DIR/$profile_id_arg/client.crt" 2>/dev/null || echo "")
+    local stored_crt_bytes
+    if [[ -n "$profile_id_arg" && -n "$profile_json" ]] && stored_crt_bytes=$("$FD_HELPER" read "$PROFILES_DIR/$profile_id_arg/client.crt" "$MAX_CERT_CRT_SIZE" 2>/dev/null); then
+      stored_issuer=$(printf '%s' "$stored_crt_bytes" | openssl x509 -noout -issuer -in /dev/stdin 2>/dev/null || echo "")
     fi
     local stored_domain=""
     if [[ -n "$profile_json" ]]; then
