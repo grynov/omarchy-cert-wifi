@@ -3,7 +3,7 @@
 Universal Omarchy Quattro shell plugin for 802.1X EAP-TLS certificate-based Wi-Fi networks (including easyroam, eduroam, campus, and enterprise RADIUS networks).
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="Certificate Wi-Fi Manager Interface" width="480">
+  <img src="preview.png" alt="Certificate Wi-Fi Manager Interface" width="480">
 </p>
 
 ## Overview
