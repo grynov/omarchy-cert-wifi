@@ -188,6 +188,91 @@ BASE_TMP=$(ls -d "$XDG_DATA_HOME/cert-wifi/.tmp_"* 2>/dev/null || true)
 [[ -z "$BASE_TMP" ]] || { echo "FAIL: Leftover temp staging directory in BASE_DIR"; exit 1; }
 echo "PASS: Private temp directory cleaned up properly without leakage"
 
+echo "=== Test 17: Producer-Side Traversal Ceiling & Oversized File Rejection in Discover ==="
+TEST_DISCOVER_DIR="$TEST_TMP_DIR/discover_test"
+mkdir -p "$TEST_DISCOVER_DIR"
+for i in $(seq 1 70); do
+  touch "$TEST_DISCOVER_DIR/cert_${i}.p12"
+done
+# Add an oversized 11MB file and a symlink
+dd if=/dev/zero of="$TEST_DISCOVER_DIR/huge.p12" bs=1M count=11 2>/dev/null
+ln -s "/etc/hosts" "$TEST_DISCOVER_DIR/symlink.p12"
+
+# Temporarily override HOME to test discover capping
+OLD_HOME="$HOME"
+export HOME="$TEST_TMP_DIR/fake_home"
+mkdir -p "$HOME/Downloads"
+cp -r "$TEST_DISCOVER_DIR"/* "$HOME/Downloads/"
+
+DISC_OUT=$("$HELPER" discover)
+export HOME="$OLD_HOME"
+
+FILE_COUNT=$(echo "$DISC_OUT" | jq -r '.files | length')
+(( FILE_COUNT <= 50 )) || { echo "FAIL: Discovered files exceeded limit of 50 (got $FILE_COUNT)"; exit 1; }
+# Verify huge.p12 and symlink.p12 were ignored
+echo "$DISC_OUT" | jq -e 'all(.files[]; .name != "huge.p12" and .name != "symlink.p12")' >/dev/null
+echo "PASS: Traversal count ceiling (max 50) and rejection of oversized (>10MB) / symlink files in discover"
+
+echo "=== Test 18: Reject Oversized (>64KB) and Symlinked profile.json in List ==="
+# Create profile with symlink profile.json
+mkdir -p "$XDG_DATA_HOME/cert-wifi/profiles/symlink_prof"
+ln -s "/etc/hosts" "$XDG_DATA_HOME/cert-wifi/profiles/symlink_prof/profile.json"
+
+# Create profile with oversized profile.json (100KB)
+mkdir -p "$XDG_DATA_HOME/cert-wifi/profiles/huge_prof"
+python3 -c "import json; open('$XDG_DATA_HOME/cert-wifi/profiles/huge_prof/profile.json', 'w').write(json.dumps({'ssid': 'Huge', 'padding': 'x'*100000}))" 2>/dev/null || \
+  printf '{"ssid":"Huge","padding":"%*s"}' 100000 "x" > "$XDG_DATA_HOME/cert-wifi/profiles/huge_prof/profile.json"
+
+LIST_HARDEN_OUT=$("$HELPER" list)
+echo "$LIST_HARDEN_OUT" | jq -e 'all(.profiles[]; .id != "symlink_prof" and .id != "huge_prof")' >/dev/null
+rm -rf "$XDG_DATA_HOME/cert-wifi/profiles/symlink_prof" "$XDG_DATA_HOME/cert-wifi/profiles/huge_prof"
+echo "PASS: Rejected symlinked and oversized profile.json in list"
+
+echo "=== Test 19: Maximum Profile Count Bounding in List (Max 50) ==="
+for i in $(seq 1 60); do
+  P_DIR="$XDG_DATA_HOME/cert-wifi/profiles/bulk_${i}"
+  mkdir -p "$P_DIR"
+  echo "{\"id\":\"bulk_${i}\",\"ssid\":\"bulk_${i}\"}" > "$P_DIR/profile.json"
+done
+
+BULK_LIST=$("$HELPER" list)
+BULK_COUNT=$(echo "$BULK_LIST" | jq -r '.profiles | length')
+(( BULK_COUNT <= 50 )) || { echo "FAIL: Profile count exceeded limit of 50 (got $BULK_COUNT)"; exit 1; }
+# Clean up bulk profiles
+rm -rf "$XDG_DATA_HOME/cert-wifi/profiles/bulk_"*
+echo "PASS: Bounded list profile count to maximum of 50"
+
+echo "=== Test 20: Safe Profile Reading in Connect and Disconnect ==="
+mkdir -p "$XDG_DATA_HOME/cert-wifi/profiles/fake_symlink"
+ln -s "/etc/hosts" "$XDG_DATA_HOME/cert-wifi/profiles/fake_symlink/profile.json"
+# connect should fail safely without reading the symlink target
+if "$HELPER" connect --id "fake_symlink" 2>/dev/null; then
+  echo "FAIL: Expected rejection connecting to invalid symlinked profile"
+  exit 1
+fi
+rm -rf "$XDG_DATA_HOME/cert-wifi/profiles/fake_symlink"
+echo "PASS: Handled symlinked profile safely in connect"
+
+echo "=== Test 21: Inspect and Install Reject Oversized / Symlinked Certificate Bundles ==="
+OVERSIZED_P12="$TEST_TMP_DIR/oversized.p12"
+dd if=/dev/zero of="$OVERSIZED_P12" bs=1M count=12 2>/dev/null
+if printf "%s" "$TEST_PASS" | "$HELPER" inspect --file "$OVERSIZED_P12" 2>/dev/null; then
+  echo "FAIL: Expected inspect rejection on >10MB certificate bundle"
+  exit 1
+fi
+if printf "%s" "$TEST_PASS" | "$HELPER" install --file "$OVERSIZED_P12" --ssid "BigNet" 2>/dev/null; then
+  echo "FAIL: Expected install rejection on >10MB certificate bundle"
+  exit 1
+fi
+
+SYMLINK_P12="$TEST_TMP_DIR/symlink_bundle.p12"
+ln -s "$MOCK_P12" "$SYMLINK_P12"
+if printf "%s" "$TEST_PASS" | "$HELPER" inspect --file "$SYMLINK_P12" 2>/dev/null; then
+  echo "FAIL: Expected inspect rejection on symlinked certificate bundle"
+  exit 1
+fi
+echo "PASS: Rejected oversized (>10MB) and symlinked certificate bundles in inspect and install"
+
 echo "================================================="
-echo "All 16 security and unit tests passed successfully."
+echo "All 21 security and unit tests passed successfully."
 echo "================================================="

@@ -7,7 +7,10 @@ console.log("=== Running Model.js Unit Tests ===");
 assert.strictEqual(Model.parseJson("", null), null);
 assert.strictEqual(Model.parseJson("{ invalid", "fallback"), "fallback");
 assert.deepStrictEqual(Model.parseJson('{"success":true}', null), { success: true });
-console.log("PASS: parseJson");
+// Oversized string (>1MB) should safely return fallback without parsing
+const oversizedPayload = " ".repeat(1048577);
+assert.strictEqual(Model.parseJson(oversizedPayload, "fallback"), "fallback");
+console.log("PASS: parseJson (including oversized payload guard)");
 
 // 2. barIconState
 const emptyState = Model.barIconState([], "");

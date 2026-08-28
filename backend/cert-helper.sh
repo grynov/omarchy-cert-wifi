@@ -13,6 +13,16 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 1
 fi
 
+# Global Resource & Security Limits
+MAX_CERT_FILE_SIZE=$((10 * 1024 * 1024))   # 10 MB maximum for certificate bundles
+MAX_PROFILE_JSON_SIZE=$((64 * 1024))       # 64 KB maximum for profile.json
+MAX_CERT_CRT_SIZE=$((1 * 1024 * 1024))     # 1 MB maximum for .crt files
+MAX_DISCOVER_SCAN_PER_DIR=100              # Maximum find results scanned per directory
+MAX_DISCOVER_FILES=50                      # Maximum certificate files returned in discover
+MAX_DISCOVER_NETWORKS=30                   # Maximum Wi-Fi networks returned in discover
+MAX_PROFILES_COUNT=50                      # Maximum profile directories processed in list
+MAX_AGGREGATE_OUTPUT_SIZE=$((512 * 1024))  # 512 KB maximum stdout payload
+
 BASE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/cert-wifi"
 PROFILES_DIR="$BASE_DIR/profiles"
 mkdir -p "$PROFILES_DIR"
@@ -32,6 +42,43 @@ die() {
   local msg="$1"
   jq -c -n --arg error "$msg" '{success: false, error: $error}' >&2
   exit 1
+}
+
+# Validate that a file is a regular file, not a symlink, and within max byte limit
+is_safe_regular_file() {
+  local f="$1"
+  local max_bytes="${2:-$MAX_CERT_FILE_SIZE}"
+  [[ -f "$f" && ! -L "$f" ]] || return 1
+  local size
+  size=$(stat -c%s "$f" 2>/dev/null || echo -1)
+  (( size >= 0 && size <= max_bytes )) || return 1
+  return 0
+}
+
+# Safely read and validate profile.json without unbounded reads or symlink traversal
+read_safe_profile_json() {
+  local pdir="$1"
+  local json_file="$pdir/profile.json"
+  if is_safe_regular_file "$json_file" "$MAX_PROFILE_JSON_SIZE"; then
+    local content
+    content=$(head -c "$MAX_PROFILE_JSON_SIZE" "$json_file" 2>/dev/null || echo "")
+    if [[ -n "$content" ]] && jq -e . <<< "$content" >/dev/null 2>&1; then
+      printf '%s' "$content"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Safely emit JSON to stdout with aggregate size ceiling enforcement
+safe_emit_json() {
+  local out="$1"
+  local len
+  len=$(LC_ALL=C printf '%s' "$out" | wc -c)
+  if (( len > MAX_AGGREGATE_OUTPUT_SIZE )); then
+    die "Output exceeds maximum aggregate response size limit (${len} bytes > ${MAX_AGGREGATE_OUTPUT_SIZE} bytes)."
+  fi
+  printf '%s\n' "$out"
 }
 
 # Safely generate a profile ID from SSID preventing slug collapse, traversal, or empty values
@@ -113,39 +160,60 @@ cmd_discover() {
     local max_d=2
     [[ "$dir" == "$HOME" ]] && max_d=1
     while IFS= read -r f; do
-      [[ -f "$f" ]] || continue
-      found+=("$f")
-    done < <(find "$dir" -maxdepth "$max_d" -type f \( -name "*.p12" -o -name "*.pfx" \) 2>/dev/null | sort -u)
+      [[ -n "$f" ]] || continue
+      if is_safe_regular_file "$f" "$MAX_CERT_FILE_SIZE"; then
+        found+=("$f")
+        if (( ${#found[@]} >= MAX_DISCOVER_FILES )); then
+          break 2
+        fi
+      fi
+    done < <(find "$dir" -maxdepth "$max_d" -type f \( -name "*.p12" -o -name "*.pfx" \) 2>/dev/null | head -n "$MAX_DISCOVER_SCAN_PER_DIR")
   done
 
-  mapfile -t unique_found < <(printf '%s\n' "${found[@]}" | sort -u)
+  mapfile -t unique_found < <(printf '%s\n' "${found[@]}" | sort -u | head -n "$MAX_DISCOVER_FILES")
+
+  local file_items=()
+  for f in "${unique_found[@]}"; do
+    [[ -n "$f" ]] || continue
+    if is_safe_regular_file "$f" "$MAX_CERT_FILE_SIZE"; then
+      local fname size mtime
+      fname=$(basename "$f")
+      size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+      mtime=$(stat -c%Y "$f" 2>/dev/null || echo 0)
+      file_items+=("$(jq -c -n --arg path "$f" --arg name "$fname" --argjson size "$size" --argjson mtime "$mtime" \
+        '{path: $path, name: $name, size: $size, mtime: $mtime}')")
+    fi
+  done
 
   local file_results="[]"
-  for f in "${unique_found[@]}"; do
-    [[ -n "$f" && -f "$f" ]] || continue
-    local fname size mtime
-    fname=$(basename "$f")
-    size=$(stat -c%s "$f" 2>/dev/null || echo 0)
-    mtime=$(stat -c%Y "$f" 2>/dev/null || echo 0)
-    file_results=$(jq -c --arg path "$f" --arg name "$fname" --argjson size "$size" --argjson mtime "$mtime" \
-      '. += [{"path": $path, "name": $name, "size": $size, "mtime": $mtime}]' <<< "$file_results")
-  done
+  if (( ${#file_items[@]} > 0 )); then
+    file_results=$(printf '%s\n' "${file_items[@]}" | jq -c -s '.')
+  fi
 
   # 2. Discover visible Wi-Fi networks
-  local net_results="[]"
+  local net_items=()
   if command -v nmcli >/dev/null 2>&1; then
     while IFS=: read -r s_ssid s_sec s_sig; do
       [[ -n "$s_ssid" ]] || continue
-      net_results=$(jq -c --arg ssid "$s_ssid" --arg sec "$s_sec" --arg sig "$s_sig" \
-        'if any(.[]; .ssid == $ssid) then . else . + [{"ssid": $ssid, "security": $sec, "signal": ($sig|tonumber? // 0)}] end' \
-        <<< "$net_results")
-    done < <(nmcli -t -f SSID,SECURITY,SIGNAL dev wifi 2>/dev/null | head -n 30 || true)
+      net_items+=("$(jq -c -n --arg ssid "$s_ssid" --arg sec "$s_sec" --arg sig "$s_sig" \
+        '{ssid: $ssid, security: $sec, signal: ($sig|tonumber? // 0)}')")
+      if (( ${#net_items[@]} >= MAX_DISCOVER_NETWORKS )); then
+        break
+      fi
+    done < <(nmcli -t -f SSID,SECURITY,SIGNAL dev wifi 2>/dev/null | head -n "$MAX_DISCOVER_NETWORKS" || true)
   fi
 
-  jq -c -n \
+  local net_results="[]"
+  if (( ${#net_items[@]} > 0 )); then
+    net_results=$(printf '%s\n' "${net_items[@]}" | jq -c -s 'unique_by(.ssid)')
+  fi
+
+  local out
+  out=$(jq -c -n \
     --argjson files "$file_results" \
     --argjson networks "$net_results" \
-    '{success: true, files: $files, networks: $networks}'
+    '{success: true, files: $files, networks: $networks}')
+  safe_emit_json "$out"
 }
 
 cmd_inspect() {
@@ -167,7 +235,7 @@ cmd_inspect() {
 
   [[ -n "$file" ]] || die "File not provided."
   file="${file/#\~/$HOME}"
-  [[ -f "$file" ]] || die "File not found: $file"
+  is_safe_regular_file "$file" "$MAX_CERT_FILE_SIZE" || die "File not found, is not a regular file, or exceeds maximum allowable size (10 MB): $file"
 
   if [[ "$pass_given" != "true" ]] && ! [ -t 0 ]; then
     IFS= read -t 1 -r pass || true
@@ -251,7 +319,8 @@ cmd_inspect() {
   local has_ca=false
   [[ -s "$ca_cert" ]] && has_ca=true
 
-  jq -c -n \
+  local out
+  out=$(jq -c -n \
     --arg path "$file" \
     --arg subject "$subject" \
     --arg issuer "$issuer" \
@@ -275,7 +344,8 @@ cmd_inspect() {
       daysRemaining: $daysRemaining,
       isExpired: ($daysRemaining <= 0),
       hasCa: $hasCa
-    }'
+    }')
+  safe_emit_json "$out"
 }
 
 cmd_install() {
@@ -311,7 +381,7 @@ cmd_install() {
 
   [[ -n "$file" ]] || die "Certificate file not provided."
   file="${file/#\~/$HOME}"
-  [[ -f "$file" ]] || die "Certificate file not found: $file"
+  is_safe_regular_file "$file" "$MAX_CERT_FILE_SIZE" || die "Certificate file not found, is not a regular file, or exceeds maximum allowable size (10 MB): $file"
   [[ -n "$ssid" ]] || die "SSID cannot be empty."
 
   local ssid_bytes
@@ -561,7 +631,8 @@ AutoConnect=true
     fi
   fi
 
-  jq -c -n \
+  local out
+  out=$(jq -c -n \
     --arg id "$profile_id" \
     --arg ssid "$ssid" \
     --arg identity "$identity" \
@@ -578,12 +649,10 @@ AutoConnect=true
       backend: $backend,
       notAfter: $notAfter,
       daysRemaining: $daysRemaining
-    }'
+    }')
+  safe_emit_json "$out"
 }
-
 cmd_list() {
-  local list="[]"
-  
   local active_ssid=""
   if command -v nmcli >/dev/null 2>&1; then
     active_ssid=$(nmcli -t -f TYPE,STATE,CONNECTION dev 2>/dev/null | grep '^wifi:connected:' | head -n 1 | cut -d: -f3- || echo "")
@@ -599,21 +668,31 @@ cmd_list() {
     fi
   fi
 
-  for pdir in "$PROFILES_DIR"/*; do
-    [[ -d "$pdir" && -f "$pdir/profile.json" ]] || continue
-    local pjson client_cert
-    pjson=$(cat "$pdir/profile.json" 2>/dev/null || echo "{}")
-    client_cert="$pdir/client.crt"
+  local profile_items=()
+  local count=0
 
-    local not_after end_epoch now_epoch days_remaining
-    if [[ -f "$client_cert" ]]; then
+  for pdir in "$PROFILES_DIR"/*; do
+    [[ -d "$pdir" ]] || continue
+    (( count < MAX_PROFILES_COUNT )) || break
+
+    local pid
+    pid=$(basename "$pdir")
+    [[ "$pid" =~ ^[a-z0-9_-]+$ ]] || continue
+
+    local pjson
+    if ! pjson=$(read_safe_profile_json "$pdir"); then
+      continue
+    fi
+
+    local client_cert="$pdir/client.crt"
+    local not_after="" end_epoch=0 now_epoch=0 days_remaining=0
+    if is_safe_regular_file "$client_cert" "$MAX_CERT_CRT_SIZE"; then
       not_after=$(openssl x509 -noout -enddate -in "$client_cert" 2>/dev/null | cut -d= -f2 || echo "")
-      end_epoch=$(LC_ALL=C date -d "$not_after" +%s 2>/dev/null || echo 0)
-      now_epoch=$(date +%s)
-      days_remaining=$(( (end_epoch - now_epoch) / 86400 ))
-    else
-      days_remaining=0
-      not_after=""
+      if [[ -n "$not_after" ]]; then
+        end_epoch=$(LC_ALL=C date -d "$not_after" +%s 2>/dev/null || echo 0)
+        now_epoch=$(date +%s)
+        days_remaining=$(( (end_epoch - now_epoch) / 86400 ))
+      fi
     fi
 
     local p_ssid
@@ -630,15 +709,24 @@ cmd_list() {
       --arg notAfter "$not_after" \
       '.daysRemaining = $daysRemaining | .isExpired = ($daysRemaining <= 0) | .isConnected = $isConnected | .notAfter = $notAfter' \
       <<< "$pjson" 2>/dev/null || echo "")
+
     if [[ -n "$updated" ]]; then
-      list=$(jq -c --argjson item "$updated" '. += [$item]' <<< "$list")
+      profile_items+=("$updated")
+      count=$((count + 1))
     fi
   done
 
-  jq -c -n \
+  local list="[]"
+  if (( ${#profile_items[@]} > 0 )); then
+    list=$(printf '%s\n' "${profile_items[@]}" | jq -c -s '.')
+  fi
+
+  local out
+  out=$(jq -c -n \
     --arg activeSsid "$active_ssid" \
     --argjson profiles "$list" \
-    '{success: true, activeSsid: $activeSsid, profiles: $profiles}'
+    '{success: true, activeSsid: $activeSsid, profiles: $profiles}')
+  safe_emit_json "$out"
 }
 
 cmd_delete() {
@@ -658,9 +746,10 @@ cmd_delete() {
   [[ -d "$profile_dir" && "$profile_dir" != "$PROFILES_DIR" && "$profile_dir" != "$BASE_DIR" ]] || die "Profile directory not found: $profile_id"
 
   local ssid="" backend="networkmanager"
-  if [[ -f "$profile_dir/profile.json" ]]; then
-    ssid=$(jq -r '.ssid // ""' "$profile_dir/profile.json" 2>/dev/null || echo "")
-    backend=$(jq -r '.backend // "networkmanager"' "$profile_dir/profile.json" 2>/dev/null || echo "networkmanager")
+  local pjson
+  if pjson=$(read_safe_profile_json "$profile_dir"); then
+    ssid=$(jq -r '.ssid // ""' <<< "$pjson" 2>/dev/null || echo "")
+    backend=$(jq -r '.backend // "networkmanager"' <<< "$pjson" 2>/dev/null || echo "networkmanager")
   fi
 
   if [[ -n "$ssid" ]]; then
@@ -680,7 +769,9 @@ cmd_delete() {
   fi
 
   rm -rf "$profile_dir"
-  jq -c -n --arg deleted "$profile_id" '{success: true, deleted: $deleted}'
+  local out
+  out=$(jq -c -n --arg deleted "$profile_id" '{success: true, deleted: $deleted}')
+  safe_emit_json "$out"
 }
 
 cmd_connect() {
@@ -692,9 +783,12 @@ cmd_connect() {
       --id)
         local query_id
         query_id=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
-        if [[ "$query_id" =~ ^[a-z0-9_-]+$ && "$query_id" != "." && "$query_id" != ".." && -f "$PROFILES_DIR/$query_id/profile.json" ]]; then
-          ssid=$(jq -r '.ssid // ""' "$PROFILES_DIR/$query_id/profile.json" 2>/dev/null || echo "")
-          profile_id_arg="$query_id"
+        if [[ "$query_id" =~ ^[a-z0-9_-]+$ && "$query_id" != "." && "$query_id" != ".." ]]; then
+          local pjson
+          if pjson=$(read_safe_profile_json "$PROFILES_DIR/$query_id"); then
+            ssid=$(jq -r '.ssid // ""' <<< "$pjson" 2>/dev/null || echo "")
+            profile_id_arg="$query_id"
+          fi
         fi
         shift 2 ;;
       *) shift ;;
@@ -707,15 +801,17 @@ cmd_connect() {
     # Sanitize the existing NM connection before activating:
     # Remove any stale anonymous-identity for easyroam profiles (causes RADIUS routing failure)
     local profile_json=""
-    if [[ -n "$profile_id_arg" && -f "$PROFILES_DIR/$profile_id_arg/profile.json" ]]; then
-      profile_json=$(cat "$PROFILES_DIR/$profile_id_arg/profile.json" 2>/dev/null || echo "")
+    if [[ -n "$profile_id_arg" ]]; then
+      profile_json=$(read_safe_profile_json "$PROFILES_DIR/$profile_id_arg" || echo "")
     fi
     local stored_issuer=""
-    if [[ -f "$PROFILES_DIR/$profile_id_arg/client.crt" ]]; then
+    if [[ -n "$profile_id_arg" && -n "$profile_json" ]] && is_safe_regular_file "$PROFILES_DIR/$profile_id_arg/client.crt" "$MAX_CERT_CRT_SIZE"; then
       stored_issuer=$(openssl x509 -noout -issuer -in "$PROFILES_DIR/$profile_id_arg/client.crt" 2>/dev/null || echo "")
     fi
-    local stored_domain
-    stored_domain=$(printf '%s' "$profile_json" | jq -r '.domain // ""' 2>/dev/null || echo "")
+    local stored_domain=""
+    if [[ -n "$profile_json" ]]; then
+      stored_domain=$(printf '%s' "$profile_json" | jq -r '.domain // ""' 2>/dev/null || echo "")
+    fi
     if [[ "$stored_issuer" =~ (easyroam|geteduroam|DFN-Verein) || "$stored_domain" =~ easyroam ]]; then
       nmcli connection modify id "$ssid" 802-1x.anonymous-identity "" 802-1x.system-ca-certs yes >/dev/null 2>&1 || \
         nmcli connection modify "$ssid" 802-1x.anonymous-identity "" 802-1x.system-ca-certs yes >/dev/null 2>&1 || true
@@ -727,7 +823,9 @@ cmd_connect() {
     iwctl station "$wlan_dev" connect "$ssid" >/dev/null || die "Failed to connect to $ssid via iwctl."
   fi
 
-  jq -c -n --arg connected "$ssid" '{success: true, connected: $connected}'
+  local out
+  out=$(jq -c -n --arg connected "$ssid" '{success: true, connected: $connected}')
+  safe_emit_json "$out"
 }
 
 cmd_disconnect() {
@@ -738,8 +836,11 @@ cmd_disconnect() {
       --id)
         local query_id
         query_id=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
-        if [[ "$query_id" =~ ^[a-z0-9_-]+$ && "$query_id" != "." && "$query_id" != ".." && -f "$PROFILES_DIR/$query_id/profile.json" ]]; then
-          ssid=$(jq -r '.ssid // ""' "$PROFILES_DIR/$query_id/profile.json" 2>/dev/null || echo "")
+        if [[ "$query_id" =~ ^[a-z0-9_-]+$ && "$query_id" != "." && "$query_id" != ".." ]]; then
+          local pjson
+          if pjson=$(read_safe_profile_json "$PROFILES_DIR/$query_id"); then
+            ssid=$(jq -r '.ssid // ""' <<< "$pjson" 2>/dev/null || echo "")
+          fi
         fi
         shift 2 ;;
       *) shift ;;
@@ -754,7 +855,9 @@ cmd_disconnect() {
     iwctl station "$wlan_dev" disconnect >/dev/null 2>&1 || true
   fi
 
-  jq -c -n --arg disconnected "${ssid:-all}" '{success: true, disconnected: $disconnected}'
+  local out
+  out=$(jq -c -n --arg disconnected "${ssid:-all}" '{success: true, disconnected: $disconnected}')
+  safe_emit_json "$out"
 }
 
 cmd_status() {

@@ -1,7 +1,9 @@
 function parseJson(raw, fallback) {
   try {
     if (!raw) return fallback !== undefined ? fallback : null;
-    var parsed = JSON.parse(String(raw).trim());
+    var str = String(raw).trim();
+    if (str.length > 1048576) return fallback !== undefined ? fallback : null;
+    var parsed = JSON.parse(str);
     return parsed !== null && parsed !== undefined ? parsed : (fallback !== undefined ? fallback : null);
   } catch (e) {
     return fallback !== undefined ? fallback : null;
